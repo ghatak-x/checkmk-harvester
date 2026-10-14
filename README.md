@@ -37,8 +37,8 @@ Build the MKP locally or download it from a GitHub release / Checkmk Exchange pa
 
 ```bash
 python tools/build_mkp.py
-mkp add dist/harvester-0.1.0.mkp
-mkp enable harvester 0.1.0
+mkp add dist/harvester-0.1.1.mkp
+mkp enable harvester 0.1.1
 cmk -R
 ```
 
@@ -59,7 +59,7 @@ kubectl apply -f docs/harvester_rbac.yaml
 kubectl -n checkmk-monitoring create token checkmk-harvester
 ```
 
-Store the generated token in the Checkmk password store and reference it from the Harvester special agent rule.
+Store the generated token in the Checkmk password store and reference it from the Harvester special agent rule. The token is used **only** for the Kubernetes API. Expired tokens (401), forbidden resources (403), API failures and connection errors cause the special agent to fail visibly rather than silently dropping host services. The special agent skips HTTP 404 only for explicitly optional Harvester/Longhorn resources; the nodes, pods and Harvester settings lists are mandatory.
 
 ### `docs/harvester_node_collector.yaml`
 
@@ -79,7 +79,7 @@ kubectl -n checkmk-monitoring rollout status daemonset/checkmk-harvester-node-co
 
 1. Apply `docs/harvester_rbac.yaml` and create/store a token for the `checkmk-harvester` ServiceAccount.
 2. Create a host in Checkmk for the Harvester cluster/source endpoint.
-3. Configure the **Harvester** special agent rule with the API endpoint, token, Prometheus endpoint and cluster name.
+3. Configure the **Harvester** special agent rule with the API endpoint, token, Prometheus endpoint and cluster name. Prometheus authentication is **independent and optional**; it does not receive the Kubernetes API token automatically. Configure a separate Prometheus bearer token in the Prometheus endpoint section only if needed. For remote endpoints, use verified HTTPS with bearer authentication.
 4. Optionally deploy `docs/harvester_node_collector.yaml` and enable node collector log ingestion in the rule.
 5. Run service discovery on the source host and generated Harvester node piggyback hosts.
 

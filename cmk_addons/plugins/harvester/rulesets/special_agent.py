@@ -89,17 +89,23 @@ def _thresholds_form() -> Dictionary:
     )
 
 
-def _endpoint_form(title: str, help_text: str, hint: str) -> Dictionary:
-    return Dictionary(
-        title=Title(title),
-        migrate=_migrate_dict,
-        elements={
-            "endpoint_v2": DictElement(required=True, parameter_form=String(title=Title("Endpoint"), prefill=InputHint(hint), custom_validate=(validators.LengthInRange(min_value=1),), help_text=Help(help_text))),
-            "verify_cert": DictElement(required=True, parameter_form=BooleanChoice(title=Title("SSL certificate verification"), label=Label("Verify certificate"), prefill=DefaultValue(True))),
-            "proxy": DictElement(required=False, parameter_form=String(title=Title("Proxy"), help_text=Help("Use FROM_ENVIRONMENT, NO_PROXY, or a proxy URL."), prefill=InputHint("FROM_ENVIRONMENT"))),
-            "timeout": DictElement(required=False, parameter_form=_timeout_form()),
-        },
-    )
+def _endpoint_form(title: str, help_text: str, hint: str, *, optional_auth: bool = False) -> Dictionary:
+    elements = {
+        "endpoint_v2": DictElement(required=True, parameter_form=String(title=Title("Endpoint"), prefill=InputHint(hint), custom_validate=(validators.LengthInRange(min_value=1),), help_text=Help(help_text))),
+        "verify_cert": DictElement(required=True, parameter_form=BooleanChoice(title=Title("SSL certificate verification"), label=Label("Verify certificate"), prefill=DefaultValue(True))),
+        "proxy": DictElement(required=False, parameter_form=String(title=Title("Proxy"), help_text=Help("Use FROM_ENVIRONMENT, NO_PROXY, or a proxy URL."), prefill=InputHint("FROM_ENVIRONMENT"))),
+        "timeout": DictElement(required=False, parameter_form=_timeout_form()),
+    }
+    if optional_auth:
+        elements["token"] = DictElement(
+            required=False,
+            parameter_form=Password(
+                title=Title("Prometheus bearer token (optional)"),
+                help_text=Help("Independent Prometheus credential. The Kubernetes API token is not automatically sent to Prometheus. Remote authenticated endpoints require verified HTTPS."),
+                migrate=migrate_to_password,
+            ),
+        )
+    return Dictionary(title=Title(title), migrate=_migrate_dict, elements=elements)
 
 
 def _migrate_nodes(value: object) -> tuple[str, object]:
@@ -117,7 +123,7 @@ def _parameter_form() -> Dictionary:
             "cluster_name": DictElement(required=True, parameter_form=String(title=Title("Cluster name"), custom_validate=(validators.LengthInRange(min_value=1),), help_text=Help("Used to make node piggyback host names unique."))),
             "token": DictElement(required=True, parameter_form=Password(title=Title("Bearer token"), custom_validate=(validators.LengthInRange(min_value=1),), migrate=migrate_to_password)),
             "kubernetes_api_server": DictElement(required=True, parameter_form=_endpoint_form("Kubernetes API server", "Endpoint used to query Harvester, Kubernetes and Longhorn API resources.", "https://api.example:6443")),
-            "prometheus": DictElement(required=True, parameter_form=_endpoint_form("Prometheus endpoint", "Prometheus base URL used for node_*, kube_node_* and longhorn_* metrics. Do not append /api/v1/query.", "https://prometheus.example:9090")),
+            "prometheus": DictElement(required=True, parameter_form=_endpoint_form("Prometheus endpoint", "Prometheus base URL used for node_*, kube_node_* and longhorn_* metrics. Do not append /api/v1/query.", "https://prometheus.example:9090", optional_auth=True)),
             "node_hostname_mode": DictElement(required=False, parameter_form=SingleChoice(
                 title=Title("Node piggyback host name"),
                 prefill=DefaultValue("prefixed"),
