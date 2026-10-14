@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: checkmk-monitoring
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: checkmk-harvester
+  namespace: checkmk-monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: checkmk-harvester-view
+rules:
+- apiGroups: [""]
+  resources:
+  - nodes
+  - pods
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["harvesterhci.io"]
+  resources:
+  - settings
+  - blockdevices
+  - virtualmachineimages
+  - virtualmachinebackups
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["node.harvesterhci.io"]
+  resources:
+  - nodeconfigs
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["longhorn.io"]
+  resources:
+  - nodes
+  - volumes
+  - replicas
+  - backuptargets
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: checkmk-harvester-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: checkmk-harvester-view
+subjects:
+- kind: ServiceAccount
+  name: checkmk-harvester
+  namespace: checkmk-monitoring

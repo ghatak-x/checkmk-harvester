@@ -1,0 +1,12 @@
+{
+  "name": "harvester",
+  "title": "Harvester special agent",
+  "version": "0.1.0",
+  "version.min_required": "2.5.0",
+  "version.usable_until": null,
+  "version.packaged": "manual",
+  "author": "Sudhir Chauhan",
+  "description": "Checkmk special agent for Harvester platform, Longhorn storage and optional Harvester node collector data.",
+  "download_url": "https://github.com/ghatak-x/checkmk-harvester",
+  "license": "GPL-2.0-only"
+}

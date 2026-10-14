@@ -1,0 +1,410 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: checkmk-harvester-node-collector
+  namespace: checkmk-monitoring
+  labels:
+    app.kubernetes.io/name: harvester-node-collector
+    checkmk.io/collector: harvester-node
+---
+# Additional permission for the Checkmk special-agent service account to read
+# node-collector pod logs. Apply this in addition to the Layer 2 RBAC.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: checkmk-harvester-node-collector-log-reader
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: checkmk-harvester-node-collector-log-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: checkmk-harvester-node-collector-log-reader
+subjects:
+- kind: ServiceAccount
+  name: checkmk-harvester
+  namespace: checkmk-monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: checkmk-harvester-node-collector
+  namespace: checkmk-monitoring
+  labels:
+    app.kubernetes.io/name: harvester-node-collector
+    checkmk.io/collector: harvester-node
+data:
+  collector.py: |
+    #!/usr/bin/env python3
+    from __future__ import annotations
+
+    import json
+    import os
+    import re
+    import time
+    from pathlib import Path
+
+    HOST = Path("/host")
+    NODE = os.environ.get("NODE_NAME", "")
+    INTERVAL = int(os.environ.get("COLLECT_INTERVAL", "60"))
+
+    PROCESS_PATTERNS = {
+        "rke2": re.compile(r"(^|/)rke2(\s|$)|rke2 server"),
+        "containerd": re.compile(r"(^|/)containerd(\s|$)"),
+        "kubelet": re.compile(r"(^|/)kubelet(\s|$)"),
+        "longhorn-manager": re.compile(r"longhorn-manager"),
+        "virt-handler": re.compile(r"virt-handler"),
+        "virt-launcher": re.compile(r"virt-launcher"),
+    }
+    REQUIRED = {"rke2", "containerd", "kubelet"}
+    INTERESTING_MOUNTS = {
+        "/",
+        "/oem",
+        "/usr/local",
+        "/run/initramfs/cos-state",
+        "/var/lib/harvester/defaultdisk",
+        "/var/lib/rancher",
+        "/var/lib/kubelet",
+        "/var/lib/longhorn",
+        "/var/log",
+    }
+    KERNEL_MODULES = ["dm_crypt", "nfs", "nvme_tcp", "iscsi_tcp"]
+
+    def read_text(path: Path) -> str:
+        try:
+            return path.read_text(errors="replace")
+        except Exception:
+            return ""
+
+
+    def read_lines(path: Path) -> list[str]:
+        text = read_text(path)
+        if not text:
+            return []
+        return text.splitlines()
+
+    def passwd_map() -> dict[int, str]:
+        users: dict[int, str] = {}
+        for line in read_lines(HOST / "etc/passwd"):
+            parts = line.split(":")
+            if len(parts) >= 3:
+                try:
+                    users[int(parts[2])] = parts[0]
+                except Exception:
+                    pass
+        return users
+
+    def cpu_count() -> int:
+        count = 0
+        for line in read_lines(HOST / "proc/cpuinfo"):
+            if line.startswith("processor") or line.startswith("CPU"):
+                count += 1
+        if count:
+            return count
+        return os.cpu_count() or 1
+
+    def fmt_duration(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        days, rem = divmod(seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, secs = divmod(rem, 60)
+        if days:
+            return f"{days}-{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def proc_status(pid_dir: Path) -> dict[str, str]:
+        status: dict[str, str] = {}
+        for line in read_lines(pid_dir / "status"):
+            if ":" in line:
+                key, value = line.split(":", 1)
+                status[key] = value.strip()
+        return status
+
+    def proc_cgroup(pid_dir: Path) -> str:
+        lines = read_lines(pid_dir / "cgroup")
+        return lines[0] if lines else "-"
+
+    def proc_stat_times(pid_dir: Path) -> tuple[float, float]:
+        raw = read_text(pid_dir / "stat")
+        if not raw or ")" not in raw:
+            return 0.0, 0.0
+        try:
+            rest = raw.rsplit(")", 1)[1].split()
+            hz = float(os.sysconf(os.sysconf_names.get("SC_CLK_TCK", "SC_CLK_TCK")))
+            cpu_seconds = (float(rest[11]) + float(rest[12])) / hz
+            start_seconds = float(rest[19]) / hz
+            return cpu_seconds, start_seconds
+        except Exception:
+            return 0.0, 0.0
+
+    def selected_process_rows() -> list[str]:
+        users = passwd_map()
+        uptime = uptime_seconds() or 0.0
+        rows: list[str] = [
+            "[time]",
+            str(int(time.time())),
+            "[processes]",
+            "[header] CGROUP USER VSZ RSS TIME ELAPSED PID COMMAND",
+        ]
+        proc = HOST / "proc"
+        for pid_dir in sorted((p for p in proc.iterdir() if p.name.isdigit()), key=lambda p: int(p.name)) if proc.exists() else []:
+            cmd = proc_cmdline(pid_dir)
+            if not cmd:
+                continue
+            if not any(pattern.search(cmd) for pattern in PROCESS_PATTERNS.values()):
+                continue
+            status = proc_status(pid_dir)
+            uid_text = (status.get("Uid") or "0").split()[0]
+            try:
+                uid = int(uid_text)
+            except Exception:
+                uid = 0
+            user = users.get(uid, str(uid))
+            vsz = (status.get("VmSize") or "0").split()[0]
+            rss = (status.get("VmRSS") or "0").split()[0]
+            cpu_seconds, start_seconds = proc_stat_times(pid_dir)
+            elapsed = uptime - start_seconds if start_seconds else 0.0
+            cgroup = proc_cgroup(pid_dir).replace(" ", "_")
+            rows.append(f"{cgroup} {user} {vsz} {rss} {fmt_duration(cpu_seconds)} {fmt_duration(elapsed)} {pid_dir.name} {cmd}")
+        return rows
+
+    def mem_section_lines() -> list[str]:
+        lines = []
+        for line in read_lines(HOST / "proc/meminfo"):
+            if line.startswith(("Swap:", "Mem:")) or "total:" in line:
+                continue
+            lines.append(line)
+        return lines
+
+    def cpu_section_lines() -> list[str]:
+        load = read_text(HOST / "proc/loadavg").strip()
+        threads_max = read_text(HOST / "proc/sys/kernel/threads-max").strip()
+        lines = []
+        if load:
+            lines.append(f"{load} {cpu_count()}")
+        if threads_max:
+            lines.append(threads_max)
+        return lines
+
+    def uptime_section_lines() -> list[str]:
+        uptime = read_text(HOST / "proc/uptime").strip()
+        return [uptime] if uptime else []
+
+    def lnx_if_section_lines() -> list[str]:
+        lines = read_lines(HOST / "proc/net/dev")
+        out = [line for line in lines[2:] if ":" in line]
+        iface_names = sorted(line.split(":", 1)[0].strip() for line in out)
+        for iface in iface_names:
+            out.append(f"[{iface}]")
+            speed = read_text(HOST / f"sys/class/net/{iface}/speed").strip()
+            if speed and speed.lstrip("-").isdigit() and int(speed) >= 0:
+                out.append(f"Speed: {speed}Mb/s")
+            address = read_text(HOST / f"sys/class/net/{iface}/address").strip()
+            if address:
+                out.append(f"Address: {address}")
+        return out
+
+    DISKSTAT_RE = re.compile(r" (x?[shv]d[a-z]*[0-9]*|cciss/c[0-9]+d[0-9]+|emcpower[a-z]+|dm-[0-9]+|VxVM.*|mmcblk.*|dasd[a-z]*|bcache[0-9]+|nvme[0-9]+n[0-9]+) ")
+
+    def diskstat_section_lines() -> list[str]:
+        out = [str(int(time.time()))]
+        for line in read_lines(HOST / "proc/diskstats"):
+            if DISKSTAT_RE.search(line):
+                out.append(line)
+        return out if len(out) > 1 else []
+
+    def standard_sections() -> dict[str, list[str]]:
+        return {
+            "cpu": cpu_section_lines(),
+            "mem": mem_section_lines(),
+            "uptime": uptime_section_lines(),
+            "lnx_if:sep(58)": lnx_if_section_lines(),
+            "diskstat": diskstat_section_lines(),
+            "ps_lnx": selected_process_rows(),
+        }
+
+    def parse_os_release() -> dict[str, str]:
+        data: dict[str, str] = {}
+        for line in read_text(HOST / "etc/os-release").splitlines():
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            value = value.strip().strip('"')
+            data[key] = value
+        return data
+
+    def kernel_info() -> dict[str, str]:
+        return {
+            "ostype": read_text(HOST / "proc/sys/kernel/ostype").strip(),
+            "release": read_text(HOST / "proc/sys/kernel/osrelease").strip(),
+            "version": read_text(HOST / "proc/sys/kernel/version").strip(),
+            "hostname": read_text(HOST / "proc/sys/kernel/hostname").strip(),
+        }
+
+    def uptime_seconds() -> float | None:
+        text = read_text(HOST / "proc/uptime").split()
+        if not text:
+            return None
+        try:
+            return float(text[0])
+        except Exception:
+            return None
+
+    def loadavg() -> dict[str, float]:
+        parts = read_text(HOST / "proc/loadavg").split()
+        out: dict[str, float] = {}
+        for key, idx in [("1m", 0), ("5m", 1), ("15m", 2)]:
+            try:
+                out[key] = float(parts[idx])
+            except Exception:
+                pass
+        return out
+
+    def proc_cmdline(pid_dir: Path) -> str:
+        raw = b""
+        try:
+            raw = (pid_dir / "cmdline").read_bytes()
+        except Exception:
+            pass
+        if raw:
+            return raw.replace(b"\x00", b" ").decode(errors="replace").strip()
+        return read_text(pid_dir / "comm").strip()
+
+    def collect_processes() -> tuple[dict[str, list[dict[str, object]]], dict[str, bool]]:
+        matches: dict[str, list[dict[str, object]]] = {name: [] for name in PROCESS_PATTERNS}
+        proc = HOST / "proc"
+        for pid_dir in proc.iterdir() if proc.exists() else []:
+            if not pid_dir.name.isdigit():
+                continue
+            cmd = proc_cmdline(pid_dir)
+            if not cmd:
+                continue
+            for name, pattern in PROCESS_PATTERNS.items():
+                if pattern.search(cmd):
+                    matches[name].append({"pid": int(pid_dir.name), "cmdline": cmd})
+        # Keep payload size bounded.
+        matches = {name: procs[:20] for name, procs in matches.items() if procs}
+        required = {name: bool(matches.get(name)) for name in sorted(REQUIRED)}
+        return matches, required
+
+    def collect_mounts() -> list[dict[str, object]]:
+        mounts: list[dict[str, object]] = []
+        # Prefer mountinfo because it shows the host namespace mountpoints from PID 1.
+        for line in read_text(HOST / "proc/1/mountinfo").splitlines():
+            try:
+                left, right = line.split(" - ", 1)
+                left_parts = left.split()
+                right_parts = right.split()
+                mountpoint = left_parts[4].replace("\\040", " ")
+                options = left_parts[5].split(",") if len(left_parts) > 5 else []
+                fstype = right_parts[0] if right_parts else ""
+                source = right_parts[1] if len(right_parts) > 1 else ""
+            except Exception:
+                continue
+            if mountpoint not in INTERESTING_MOUNTS:
+                continue
+            mounts.append({
+                "mountpoint": mountpoint,
+                "fstype": fstype,
+                "source": source,
+                "rw": "rw" in options,
+                "options": options[:20],
+            })
+        return mounts
+
+    def collect_modules() -> dict[str, bool]:
+        text = read_text(HOST / "proc/modules")
+        loaded = {line.split()[0] for line in text.splitlines() if line.split()}
+        return {name: name.replace("-", "_") in loaded or name in loaded for name in KERNEL_MODULES}
+
+    def collect() -> dict[str, object]:
+        processes, required = collect_processes()
+        return {
+            "version": 1,
+            "node": NODE or kernel_info().get("hostname") or "unknown",
+            "timestamp": time.time(),
+            "os_release": parse_os_release(),
+            "kernel": kernel_info(),
+            "uptime_seconds": uptime_seconds(),
+            "loadavg": loadavg(),
+            "processes": processes,
+            "required_processes": required,
+            "mounts": collect_mounts(),
+            "kernel_modules": collect_modules(),
+            "standard_sections": standard_sections(),
+        }
+
+    while True:
+        print("BEGIN_HARVESTER_NODE_COLLECTOR_JSON", flush=True)
+        print(json.dumps(collect(), sort_keys=True, separators=(",", ":")), flush=True)
+        print("END_HARVESTER_NODE_COLLECTOR_JSON", flush=True)
+        time.sleep(INTERVAL)
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: checkmk-harvester-node-collector
+  namespace: checkmk-monitoring
+  labels:
+    app.kubernetes.io/name: harvester-node-collector
+    checkmk.io/collector: harvester-node
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: harvester-node-collector
+      checkmk.io/collector: harvester-node
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: harvester-node-collector
+        checkmk.io/collector: harvester-node
+    spec:
+      serviceAccountName: checkmk-harvester-node-collector
+      hostPID: true
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: collector
+        image: python:3.12-alpine
+        imagePullPolicy: IfNotPresent
+        command: ["python3", "/collector/collector.py"]
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: COLLECT_INTERVAL
+          value: "60"
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+        volumeMounts:
+        - name: hostroot
+          mountPath: /host
+          readOnly: true
+        - name: collector-script
+          mountPath: /collector
+          readOnly: true
+      volumes:
+      - name: hostroot
+        hostPath:
+          path: /
+          type: Directory
+      - name: collector-script
+        configMap:
+          name: checkmk-harvester-node-collector

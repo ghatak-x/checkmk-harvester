@@ -1,0 +1,987 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 Sudhir Chauhan
+
+"""Checkmk special agent for Harvester / SUSE Virtualization platform monitoring.
+
+Layer 2: collect Harvester, Kubernetes node and Longhorn platform data via
+Kubernetes API plus Rancher Monitoring / Prometheus. This intentionally does not
+install or execute an OS agent on Harvester nodes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+import sys
+import time
+from collections import Counter, defaultdict
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+import requests
+import urllib3
+
+from cmk.password_store.v1_unstable import parser_add_secret_option, resolve_secret_option
+
+LOG = logging.getLogger("agent_harvester")
+
+PROM_QUERIES = {
+    "kube_node_info": "kube_node_info",
+    "kube_node_conditions": "kube_node_status_condition",
+    "node_uname_info": "node_uname_info",
+    "node_cpu_usage": '1 - avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))',
+    "node_memory_usage": "1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)",
+    "node_filesystem_size": 'node_filesystem_size_bytes{fstype!~"tmpfs|devtmpfs|overlay|squashfs|rootfs",mountpoint!~"/var/lib/kubelet/.*|/run/credentials/.*"}',
+    "node_filesystem_avail": 'node_filesystem_avail_bytes{fstype!~"tmpfs|devtmpfs|overlay|squashfs|rootfs",mountpoint!~"/var/lib/kubelet/.*|/run/credentials/.*"}',
+    "longhorn_node_status": "longhorn_node_status",
+    "longhorn_disk_status": "longhorn_disk_status",
+    "longhorn_disk_capacity": "longhorn_disk_capacity_bytes",
+    "longhorn_disk_usage": "longhorn_disk_usage_bytes",
+    "longhorn_disk_reservation": "longhorn_disk_reservation_bytes",
+    "longhorn_volume_robustness": "longhorn_volume_robustness",
+    "longhorn_volume_state": "longhorn_volume_state",
+}
+
+PLATFORM_NAMESPACES = {
+    "harvester-system",
+    "longhorn-system",
+    "cattle-monitoring-system",
+    "kube-system",
+}
+
+IMPORTANT_SETTINGS = {
+    "server-version",
+    "default-storage-class",
+    "backup-target",
+    "ntp-servers",
+    "kubevirt-migration",
+    "storage-network",
+    "vm-migration-network",
+    "upgrade-checker-enabled",
+    "upgradable-versions",
+    "rwx-network",
+}
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Monitor Harvester / SUSE Virtualization platform via Kubernetes API and Prometheus")
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    p.add_argument("--cluster", required=True)
+    p.add_argument("--kubernetes-cluster-hostname", required=True)
+    parser_add_secret_option(p, long="--token", help="Kubernetes bearer token", required=True)
+    p.add_argument("--api-server-endpoint", required=True)
+    p.add_argument("--api-server-proxy", default="FROM_ENVIRONMENT")
+    p.add_argument("--verify-cert-api", action="store_true")
+    p.add_argument("--k8s-api-connect-timeout", type=int, default=10)
+    p.add_argument("--k8s-api-read-timeout", type=int, default=20)
+    p.add_argument("--prometheus-endpoint", required=True)
+    p.add_argument("--usage-proxy", default="FROM_ENVIRONMENT")
+    p.add_argument("--usage-verify-cert", action="store_true")
+    p.add_argument("--usage-connect-timeout", type=int, default=10)
+    p.add_argument("--usage-read-timeout", type=int, default=20)
+    p.add_argument("--node-hostname-mode", choices=["prefixed", "node_name"], default="prefixed")
+    p.add_argument("--node-include-patterns", action="append", default=[])
+    p.add_argument("--node-exclude-patterns", action="append", default=[])
+    p.add_argument("--enable-node-collector-logs", action="store_true", help="Read optional Harvester node collector DaemonSet logs and enrich node piggyback data")
+    p.add_argument("--node-collector-namespace", default="checkmk-monitoring")
+    p.add_argument("--node-collector-label-selector", default="checkmk.io/collector=harvester-node")
+    p.add_argument("--node-collector-container", default="collector")
+    p.add_argument("--node-collector-tail-lines", type=int, default=400)
+    p.add_argument("--node-collector-max-age", type=int, default=600)
+    # Harvester policy/threshold knobs. Values are percentages except the state choices.
+    p.add_argument("--node-cpu-usage-warn", type=float, default=80.0)
+    p.add_argument("--node-cpu-usage-crit", type=float, default=90.0)
+    p.add_argument("--node-memory-usage-warn", type=float, default=80.0)
+    p.add_argument("--node-memory-usage-crit", type=float, default=90.0)
+    p.add_argument("--longhorn-disk-usage-warn", type=float, default=80.0)
+    p.add_argument("--longhorn-disk-usage-crit", type=float, default=90.0)
+    p.add_argument("--backup-target-not-configured-state", choices=["ok", "warn", "crit"], default="warn")
+    p.add_argument("--longhorn-degraded-volume-state", choices=["ok", "warn", "crit"], default="warn")
+    p.add_argument("--longhorn-degraded-volume-single-node-state", choices=["ok", "warn", "crit"], default="warn")
+    return p.parse_args(argv)
+
+
+def setup_logging(verbosity: int) -> None:
+    if verbosity >= 3:
+        level = logging.DEBUG
+    elif verbosity == 2:
+        level = logging.INFO
+    elif verbosity == 1:
+        level = logging.WARNING
+    else:
+        logging.disable(logging.CRITICAL)
+        level = logging.CRITICAL
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
+
+
+def _resolve_token(args: argparse.Namespace) -> str:
+    return resolve_secret_option(args, "token").reveal()
+
+
+def _proxy(value: str) -> Mapping[str, str] | None:
+    if value == "FROM_ENVIRONMENT":
+        return None
+    if value == "NO_PROXY":
+        return {"http": "", "https": ""}
+    return {"http": value, "https": value}
+
+
+def _get_json(session: requests.Session, url: str, **kwargs: Any) -> Mapping[str, Any]:
+    response = session.get(url, **kwargs)
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, Mapping):
+        raise RuntimeError(f"Unexpected JSON payload from {url}")
+    return data
+
+
+def _list_items(session: requests.Session, endpoint: str, path: str, **kwargs: Any) -> list[Mapping[str, Any]]:
+    try:
+        data = _get_json(session, endpoint.rstrip("/") + path, **kwargs)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        LOG.warning("Skipping %s, HTTP status %s", path, status)
+        return []
+    except requests.RequestException as exc:
+        LOG.warning("Skipping %s: %s", path, exc)
+        return []
+    return [item for item in data.get("items", []) if isinstance(item, Mapping)]
+
+
+
+
+def _parse_collector_payload(log_text: str) -> Mapping[str, Any] | None:
+    """Extract the newest JSON payload emitted by the optional node collector.
+
+    The collector prints repeated marker-delimited JSON blocks so the special
+    agent can use the Kubernetes pods/log subresource without a custom network
+    protocol, Service, or push credential.
+    """
+    begin = "BEGIN_HARVESTER_NODE_COLLECTOR_JSON"
+    end = "END_HARVESTER_NODE_COLLECTOR_JSON"
+    blocks: list[str] = []
+    current: list[str] | None = None
+    for line in log_text.splitlines():
+        stripped = line.strip()
+        if stripped == begin:
+            current = []
+            continue
+        if stripped == end:
+            if current:
+                blocks.append("\n".join(current))
+            current = None
+            continue
+        if current is not None:
+            current.append(line)
+    for block in reversed(blocks):
+        try:
+            payload = json.loads(block)
+        except Exception:
+            continue
+        if isinstance(payload, Mapping):
+            return payload
+    return None
+
+
+def _collect_node_collector_logs(session: requests.Session, endpoint: str, args: argparse.Namespace, request_kwargs: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    if not args.enable_node_collector_logs:
+        return {}
+    pods_path = f"/api/v1/namespaces/{args.node_collector_namespace}/pods"
+    pods = _list_items(
+        session,
+        endpoint,
+        pods_path,
+        params={"labelSelector": args.node_collector_label_selector},
+        **request_kwargs,
+    )
+    result: dict[str, Mapping[str, Any]] = {}
+    now = time.time()
+    for pod in pods:
+        meta = pod.get("metadata") or {}
+        spec = pod.get("spec") or {}
+        status = pod.get("status") or {}
+        pod_name = str(meta.get("name") or "")
+        node = str(spec.get("nodeName") or "")
+        if not pod_name or not node:
+            continue
+        if str(status.get("phase") or "") not in {"Running", "Succeeded"}:
+            result[node] = {
+                "node": node,
+                "collector_available": False,
+                "collector_pod": pod_name,
+                "collector_phase": status.get("phase"),
+                "collector_error": "collector pod is not running",
+                "collector_age_seconds": None,
+            }
+            continue
+        url = endpoint.rstrip("/") + f"/api/v1/namespaces/{args.node_collector_namespace}/pods/{pod_name}/log"
+        try:
+            response = session.get(
+                url,
+                params={"container": args.node_collector_container, "tailLines": str(args.node_collector_tail_lines)},
+                verify=request_kwargs.get("verify"),
+                timeout=request_kwargs.get("timeout"),
+                proxies=request_kwargs.get("proxies"),
+            )
+            response.raise_for_status()
+            payload = _parse_collector_payload(response.text)
+        except requests.RequestException as exc:
+            result[node] = {
+                "node": node,
+                "collector_available": False,
+                "collector_pod": pod_name,
+                "collector_error": str(exc),
+                "collector_age_seconds": None,
+            }
+            continue
+        if not payload:
+            result[node] = {
+                "node": node,
+                "collector_available": False,
+                "collector_pod": pod_name,
+                "collector_error": "no marker-delimited collector payload found in pod log",
+                "collector_age_seconds": None,
+            }
+            continue
+        payload = dict(payload)
+        timestamp = payload.get("timestamp")
+        age = None
+        try:
+            age = max(0.0, now - float(timestamp))
+        except Exception:
+            pass
+        payload.update({
+            "node": str(payload.get("node") or node),
+            "collector_available": True,
+            "collector_pod": pod_name,
+            "collector_namespace": args.node_collector_namespace,
+            "collector_age_seconds": age,
+            "collector_max_age_seconds": args.node_collector_max_age,
+        })
+        result[str(payload.get("node") or node)] = payload
+    return result
+
+def _write_section(section_name: str, data: Mapping[str, Any]) -> None:
+    sys.stdout.write(f"<<<{section_name}:sep(0)>>>")
+    sys.stdout.write("\n")
+    sys.stdout.write(json.dumps(data, separators=(",", ":"), sort_keys=True) + "\n")
+
+
+def _write_raw_section(section_name: str, lines: Sequence[str]) -> None:
+    if not lines:
+        return
+    sys.stdout.write(f"<<<{section_name}>>>\n")
+    for line in lines:
+        sys.stdout.write(line.rstrip("\n") + "\n")
+
+
+def _write_pb(piggyback: str, sections: Mapping[str, Mapping[str, Any]], raw_sections: Mapping[str, Sequence[str]] | None = None) -> None:
+    sys.stdout.write(f"<<<<{piggyback}>>>>\n")
+    for section_name, data in sections.items():
+        _write_section(section_name, data)
+    for section_name, lines in (raw_sections or {}).items():
+        _write_raw_section(section_name, lines)
+    sys.stdout.write("<<<<>>>>\n")
+
+
+def _metadata_name(obj: Mapping[str, Any]) -> str:
+    return str(((obj.get("metadata") or {}).get("name")) or "")
+
+
+def _metadata_namespace(obj: Mapping[str, Any]) -> str:
+    return str(((obj.get("metadata") or {}).get("namespace")) or "")
+
+
+def _conditions(obj: Mapping[str, Any], path: Sequence[str] = ("status", "conditions")) -> list[dict[str, Any]]:
+    data: Any = obj
+    for key in path:
+        if not isinstance(data, Mapping):
+            return []
+        data = data.get(key)
+    if not isinstance(data, list):
+        return []
+    return [dict(c) for c in data if isinstance(c, Mapping)]
+
+
+def _condition_status(conditions: Sequence[Mapping[str, Any]], ctype: str) -> str | None:
+    for cond in conditions:
+        if str(cond.get("type", "")).lower() == ctype.lower():
+            return str(cond.get("status"))
+    return None
+
+
+def _monitor_node(name: str, include: Sequence[str], exclude: Sequence[str]) -> bool:
+    if include:
+        return any(re.search(pattern, name) for pattern in include)
+    if exclude:
+        return not any(re.search(pattern, name) for pattern in exclude)
+    return True
+
+
+def _node_roles_from_labels(labels: Mapping[str, Any]) -> list[str]:
+    roles: set[str] = set()
+    for key, value in labels.items():
+        if not isinstance(key, str):
+            continue
+        prefix = "node-role.kubernetes.io/"
+        if key.startswith(prefix):
+            role = key[len(prefix):] or str(value)
+            if role:
+                roles.add(role.replace("_", "-"))
+    # Harvester/RKE2 single-node control planes commonly carry these labels.
+    for role in ("control-plane", "etcd", "master"):
+        if labels.get(f"node-role.kubernetes.io/{role}") is not None:
+            roles.add(role)
+    return sorted(roles)
+
+
+def _node_piggyback_name(args: argparse.Namespace, node: str) -> str:
+    if args.node_hostname_mode == "node_name":
+        return node
+    return f"harvester_node_{args.cluster}_{node}"
+
+
+def _prom_query_with_status(session: requests.Session, base_url: str, promql: str, **kwargs: Any) -> tuple[list[Mapping[str, Any]], bool, str | None]:
+    try:
+        data = _get_json(session, base_url.rstrip("/") + "/api/v1/query", params={"query": promql}, **kwargs)
+    except requests.RequestException as exc:
+        msg = str(exc)
+        LOG.warning("Prometheus query failed (%s): %s", promql, msg)
+        return [], False, msg
+    if data.get("status") != "success":
+        msg = str(data.get("error") or data.get("errorType") or "Prometheus returned non-success status")
+        LOG.warning("Prometheus query failed (%s): %s", promql, msg)
+        return [], False, msg
+    result = ((data.get("data") or {}).get("result") or [])
+    return [sample for sample in result if isinstance(sample, Mapping)], True, None
+
+
+def _prom_query(session: requests.Session, base_url: str, promql: str, **kwargs: Any) -> list[Mapping[str, Any]]:
+    result, _ok, _error = _prom_query_with_status(session, base_url, promql, **kwargs)
+    return result
+
+
+def _value(sample: Mapping[str, Any]) -> float:
+    value = sample.get("value", [0, 0])
+    try:
+        return float(value[1])
+    except Exception:
+        return 0.0
+
+
+def _metric(sample: Mapping[str, Any]) -> Mapping[str, Any]:
+    metric = sample.get("metric") or {}
+    return metric if isinstance(metric, Mapping) else {}
+
+
+def _hostpart(instance: str | None) -> str:
+    if not instance:
+        return ""
+    return str(instance).split(":", 1)[0]
+
+
+def _active_one_hot(results: Sequence[Mapping[str, Any]], group_labels: Sequence[str], state_label: str) -> dict[tuple[str, ...], str]:
+    active: dict[tuple[str, ...], str] = {}
+    for sample in results:
+        if _value(sample) != 1.0:
+            continue
+        metric = _metric(sample)
+        key = tuple(str(metric.get(label, "")) for label in group_labels)
+        active[key] = str(metric.get(state_label, "unknown"))
+    return active
+
+
+def collect_api(args: argparse.Namespace, token: str) -> dict[str, Any]:
+    if not args.verify_cert_api:
+        LOG.warning("Disabling SSL certificate verification for Kubernetes API endpoint.")
+    kwargs = {
+        "verify": args.verify_cert_api,
+        "timeout": (args.k8s_api_connect_timeout, args.k8s_api_read_timeout),
+        "proxies": _proxy(args.api_server_proxy),
+    }
+    with requests.Session() as session:
+        session.headers.update({"Authorization": f"Bearer {token}"})
+        data = {
+            "nodes": _list_items(session, args.api_server_endpoint, "/api/v1/nodes", **kwargs),
+            "pods": _list_items(session, args.api_server_endpoint, "/api/v1/pods", **kwargs),
+            "harvester_settings": _list_items(session, args.api_server_endpoint, "/apis/harvesterhci.io/v1beta1/settings", **kwargs),
+            "harvester_nodeconfigs": _list_items(session, args.api_server_endpoint, "/apis/node.harvesterhci.io/v1beta1/nodeconfigs", **kwargs),
+            "harvester_blockdevices": _list_items(session, args.api_server_endpoint, "/apis/harvesterhci.io/v1beta1/blockdevices", **kwargs),
+            "harvester_vm_images": _list_items(session, args.api_server_endpoint, "/apis/harvesterhci.io/v1beta1/virtualmachineimages", **kwargs),
+            "harvester_vm_backups": _list_items(session, args.api_server_endpoint, "/apis/harvesterhci.io/v1beta1/virtualmachinebackups", **kwargs),
+            "longhorn_nodes": _list_items(session, args.api_server_endpoint, "/apis/longhorn.io/v1beta2/namespaces/longhorn-system/nodes", **kwargs),
+            "longhorn_volumes": _list_items(session, args.api_server_endpoint, "/apis/longhorn.io/v1beta2/namespaces/longhorn-system/volumes", **kwargs),
+            "longhorn_replicas": _list_items(session, args.api_server_endpoint, "/apis/longhorn.io/v1beta2/namespaces/longhorn-system/replicas", **kwargs),
+            "longhorn_backuptargets": _list_items(session, args.api_server_endpoint, "/apis/longhorn.io/v1beta2/namespaces/longhorn-system/backuptargets", **kwargs),
+        }
+        data["node_collector_logs"] = _collect_node_collector_logs(session, args.api_server_endpoint, args, kwargs)
+        return data
+
+
+def collect_prometheus(args: argparse.Namespace, token: str) -> tuple[dict[str, list[Mapping[str, Any]]], dict[str, Any]]:
+    if not args.usage_verify_cert:
+        LOG.warning("Disabling SSL certificate verification for Prometheus endpoint.")
+    kwargs = {
+        "verify": args.usage_verify_cert,
+        "timeout": (args.usage_connect_timeout, args.usage_read_timeout),
+        "proxies": _proxy(args.usage_proxy),
+    }
+    result: dict[str, list[Mapping[str, Any]]] = {}
+    failures: list[dict[str, str]] = []
+    successful = 0
+    empty = 0
+    with requests.Session() as session:
+        session.headers.update({"Authorization": f"Bearer {token}"})
+        for name, query in PROM_QUERIES.items():
+            samples, ok, error = _prom_query_with_status(session, args.prometheus_endpoint, query, **kwargs)
+            result[name] = samples
+            if ok:
+                successful += 1
+                if not samples:
+                    empty += 1
+            else:
+                failures.append({"query": name, "error": error or "unknown error"})
+    status = {
+        "endpoint": args.prometheus_endpoint,
+        "query_count": len(PROM_QUERIES),
+        "successful_query_count": successful,
+        "failed_query_count": len(failures),
+        "empty_query_count": empty,
+        "available": successful > 0 and len(failures) < len(PROM_QUERIES),
+        "failures": failures[:10],
+    }
+    return result, status
+
+
+def _build_settings_section(settings: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    selected = []
+    values = {}
+    for setting in settings:
+        name = _metadata_name(setting)
+        value = setting.get("value", setting.get("default"))
+        if name in IMPORTANT_SETTINGS:
+            selected.append({
+                "name": name,
+                "value": value,
+                "default": setting.get("default"),
+                "conditions": _conditions(setting),
+            })
+        values[name] = value
+    return {
+        "count": len(settings),
+        "server_version": values.get("server-version"),
+        "default_storage_class": values.get("default-storage-class"),
+        "backup_target": values.get("backup-target"),
+        "important_settings": selected,
+    }
+
+
+def _build_vm_images_section(images: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    result = []
+    for img in images:
+        labels = ((img.get("metadata") or {}).get("labels") or {})
+        status = img.get("status") or {}
+        result.append({
+            "namespace": _metadata_namespace(img),
+            "name": _metadata_name(img),
+            "display_name": ((img.get("spec") or {}).get("displayName") or labels.get("harvesterhci.io/imageDisplayName")),
+            "os_type": labels.get("harvesterhci.io/os-type"),
+            "source_type": (img.get("spec") or {}).get("sourceType"),
+            "storage_class": status.get("storageClassName") or (img.get("spec") or {}).get("targetStorageClassName"),
+            "progress": status.get("progress"),
+            "failed": status.get("failed"),
+            "size": status.get("size"),
+            "virtual_size": status.get("virtualSize"),
+            "conditions": _conditions(img),
+        })
+    return {"images": result}
+
+
+def _build_platform_pods_section(pods: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    namespaces: dict[str, Counter[str]] = defaultdict(Counter)
+    restarts: dict[str, int] = defaultdict(int)
+    problem_pods = []
+    for pod in pods:
+        ns = _metadata_namespace(pod)
+        if ns not in PLATFORM_NAMESPACES:
+            continue
+        phase = str((pod.get("status") or {}).get("phase") or "Unknown")
+        namespaces[ns][phase] += 1
+        restart_count = 0
+        for cs in ((pod.get("status") or {}).get("containerStatuses") or []):
+            if isinstance(cs, Mapping):
+                restart_count += int(cs.get("restartCount") or 0)
+        restarts[ns] += restart_count
+        if phase not in {"Running", "Succeeded"}:
+            problem_pods.append({"namespace": ns, "name": _metadata_name(pod), "phase": phase, "restarts": restart_count})
+    return {
+        "namespaces": {ns: dict(counter) for ns, counter in namespaces.items()},
+        "restarts": dict(restarts),
+        "problem_pods": problem_pods,
+    }
+
+
+def _build_backup_targets_section(targets: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    result = []
+    for target in targets:
+        status = target.get("status") or {}
+        spec = target.get("spec") or {}
+        result.append({
+            "name": _metadata_name(target),
+            "available": status.get("available"),
+            "url": spec.get("backupTargetURL"),
+            "conditions": _conditions(target),
+            "last_synced_at": status.get("lastSyncedAt"),
+        })
+    return {"targets": result}
+
+
+def _build_longhorn_volumes_section(volumes: Sequence[Mapping[str, Any]], prom: Mapping[str, Sequence[Mapping[str, Any]]], node_count: int) -> dict[str, Any]:
+    robustness = _active_one_hot(prom.get("longhorn_volume_robustness", []), ["volume"], "state")
+    states = _active_one_hot(prom.get("longhorn_volume_state", []), ["volume"], "state")
+    result = []
+    counts = Counter()
+    for vol in volumes:
+        name = _metadata_name(vol)
+        spec = vol.get("spec") or {}
+        status = vol.get("status") or {}
+        kstatus = status.get("kubernetesStatus") or {}
+        conditions = _conditions(vol)
+        robust = robustness.get((name,), status.get("robustness") or "unknown")
+        state = states.get((name,), status.get("state") or "unknown")
+        replicas = spec.get("numberOfReplicas")
+        scheduling_failure = False
+        for cond in conditions:
+            if str(cond.get("type")) == "Scheduled" and str(cond.get("status")) == "False" and "ReplicaSchedulingFailure" in str(cond.get("reason", "")):
+                scheduling_failure = True
+        try:
+            replica_count = int(replicas or 0)
+        except Exception:
+            replica_count = 0
+        expected_single_node_degraded = bool(node_count <= 1 and replica_count > node_count and scheduling_failure)
+        counts[f"robustness_{robust}"] += 1
+        counts[f"state_{state}"] += 1
+        result.append({
+            "name": name,
+            "node": status.get("currentNodeID") or spec.get("nodeID"),
+            "pvc_namespace": kstatus.get("namespace"),
+            "pvc": kstatus.get("pvcName"),
+            "pv_status": kstatus.get("pvStatus"),
+            "workloads": kstatus.get("workloadsStatus") or [],
+            "robustness": robust,
+            "state": state,
+            "size": spec.get("size"),
+            "actual_size": status.get("actualSize"),
+            "replicas": replicas,
+            "node_count": node_count,
+            "expected_single_node_degraded": expected_single_node_degraded,
+            "conditions": conditions,
+        })
+    return {"volumes": result, "summary": dict(counts), "node_count": node_count}
+
+
+def _build_longhorn_replicas_section(replicas: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    counts = Counter()
+    per_volume = defaultdict(Counter)
+    problem = []
+    for replica in replicas:
+        spec = replica.get("spec") or {}
+        status = replica.get("status") or {}
+        state = str(status.get("currentState") or spec.get("desireState") or "unknown")
+        vol = str(spec.get("volumeName") or ((replica.get("metadata") or {}).get("labels") or {}).get("longhornvolume") or "unknown")
+        counts[state] += 1
+        per_volume[vol][state] += 1
+        if state not in {"running", "stopped"}:
+            problem.append({"name": _metadata_name(replica), "volume": vol, "state": state, "node": spec.get("nodeID")})
+    return {"summary": dict(counts), "per_volume": {k: dict(v) for k, v in per_volume.items()}, "problems": problem}
+
+
+def _node_info_from_prom(prom: Mapping[str, Sequence[Mapping[str, Any]]]) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    by_node: dict[str, dict[str, Any]] = {}
+    ip_to_node: dict[str, str] = {}
+    for sample in prom.get("kube_node_info", []):
+        metric = _metric(sample)
+        node = str(metric.get("node") or "")
+        if not node:
+            continue
+        ip = str(metric.get("internal_ip") or "")
+        if ip:
+            ip_to_node[ip] = node
+        by_node[node] = {
+            "node": node,
+            "internal_ip": ip,
+            "kernel_version": metric.get("kernel_version"),
+            "kubelet_version": metric.get("kubelet_version"),
+            "container_runtime_version": metric.get("container_runtime_version"),
+            "os_image": metric.get("os_image"),
+            "provider_id": metric.get("provider_id"),
+            "pod_cidr": metric.get("pod_cidr"),
+            "system_uuid": metric.get("system_uuid"),
+        }
+    for sample in prom.get("node_uname_info", []):
+        metric = _metric(sample)
+        node = str(metric.get("nodename") or "")
+        if not node:
+            node = ip_to_node.get(_hostpart(str(metric.get("instance") or "")), "")
+        if not node:
+            continue
+        by_node.setdefault(node, {"node": node})
+        by_node[node].update({
+            "machine": metric.get("machine"),
+            "sysname": metric.get("sysname"),
+            "release": metric.get("release"),
+            "version": metric.get("version"),
+            "node_exporter_instance": metric.get("instance"),
+        })
+    return by_node, ip_to_node
+
+
+def _node_conditions_from_prom(prom: Mapping[str, Sequence[Mapping[str, Any]]]) -> dict[str, dict[str, str]]:
+    result: dict[str, dict[str, str]] = defaultdict(dict)
+    for sample in prom.get("kube_node_conditions", []):
+        if _value(sample) != 1.0:
+            continue
+        metric = _metric(sample)
+        node = str(metric.get("node") or "")
+        condition = str(metric.get("condition") or "")
+        status = str(metric.get("status") or "unknown")
+        if node and condition:
+            result[node][condition] = status
+    return result
+
+
+def _node_metrics_from_prom(prom: Mapping[str, Sequence[Mapping[str, Any]]], ip_to_node: Mapping[str, str]) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = defaultdict(dict)
+    for key, out_key in [("node_cpu_usage", "cpu_usage"), ("node_memory_usage", "memory_usage")]:
+        for sample in prom.get(key, []):
+            metric = _metric(sample)
+            node = ip_to_node.get(_hostpart(str(metric.get("instance") or "")))
+            if node:
+                result[node][out_key] = _value(sample)
+    fs_by_node: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    for sample in prom.get("node_filesystem_size", []):
+        metric = _metric(sample)
+        node = ip_to_node.get(_hostpart(str(metric.get("instance") or "")))
+        if node:
+            mp = str(metric.get("mountpoint") or "")
+            fs_by_node[node].setdefault(mp, {"mountpoint": mp, "device": metric.get("device"), "fstype": metric.get("fstype")})["size"] = _value(sample)
+    for sample in prom.get("node_filesystem_avail", []):
+        metric = _metric(sample)
+        node = ip_to_node.get(_hostpart(str(metric.get("instance") or "")))
+        if node:
+            mp = str(metric.get("mountpoint") or "")
+            fs_by_node[node].setdefault(mp, {"mountpoint": mp, "device": metric.get("device"), "fstype": metric.get("fstype")})["avail"] = _value(sample)
+    for node, filesystems in fs_by_node.items():
+        result[node]["filesystems"] = list(filesystems.values())
+    return result
+
+
+def _nodeconfigs_by_node(configs: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    result = {}
+    for cfg in configs:
+        name = _metadata_name(cfg)
+        spec = cfg.get("spec") or {}
+        status = cfg.get("status") or {}
+        result[name] = {
+            "name": name,
+            "namespace": _metadata_namespace(cfg),
+            "ntp_configs": spec.get("ntpConfigs") or {},
+            "longhorn_config": spec.get("longhornConfig") or {},
+            "ntp_conditions": status.get("ntpConditions") or [],
+        }
+    return result
+
+
+def _blockdevices_by_node(devices: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    result: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for bd in devices:
+        spec = bd.get("spec") or {}
+        status = bd.get("status") or {}
+        device_status = status.get("deviceStatus") or {}
+        node = str(spec.get("nodeName") or ((bd.get("metadata") or {}).get("labels") or {}).get("kubernetes.io/hostname") or "")
+        if not node:
+            continue
+        details = device_status.get("details") or {}
+        cap = device_status.get("capacity") or {}
+        result[node].append({
+            "name": _metadata_name(bd),
+            "namespace": _metadata_namespace(bd),
+            "dev_path": spec.get("devPath") or device_status.get("devPath"),
+            "provision": spec.get("provision"),
+            "provision_phase": status.get("provisionPhase"),
+            "state": status.get("state"),
+            "size": cap.get("sizeBytes"),
+            "model": details.get("model"),
+            "vendor": details.get("vendor"),
+            "drive_type": details.get("driveType"),
+            "device_type": details.get("deviceType"),
+            "is_removable": details.get("isRemovable"),
+            "mountpoint": (device_status.get("fileSystem") or {}).get("mountPoint"),
+        })
+    return result
+
+
+def _longhorn_nodes_by_name(nodes: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    result = {}
+    for node in nodes:
+        name = _metadata_name(node)
+        spec = node.get("spec") or {}
+        status = node.get("status") or {}
+        disks = []
+        for disk_name, disk in (status.get("diskStatus") or {}).items():
+            if not isinstance(disk, Mapping):
+                continue
+            disks.append({
+                "name": disk_name,
+                "path": disk.get("diskPath"),
+                "type": disk.get("diskType"),
+                "uuid": disk.get("diskUUID"),
+                "storage_available": disk.get("storageAvailable"),
+                "storage_maximum": disk.get("storageMaximum"),
+                "storage_scheduled": disk.get("storageScheduled"),
+                "conditions": disk.get("conditions") or [],
+            })
+        result[name] = {
+            "name": name,
+            "allow_scheduling": spec.get("allowScheduling"),
+            "eviction_requested": spec.get("evictionRequested"),
+            "conditions": status.get("conditions") or [],
+            "disks": disks,
+        }
+    return result
+
+
+def _longhorn_status_from_prom(prom: Mapping[str, Sequence[Mapping[str, Any]]]) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, dict[str, float]]], dict[str, dict[str, dict[str, float]]]]:
+    node_status: dict[str, dict[str, float]] = defaultdict(dict)
+    for sample in prom.get("longhorn_node_status", []):
+        metric = _metric(sample)
+        node = str(metric.get("node") or "")
+        condition = str(metric.get("condition") or "")
+        if node and condition:
+            node_status[node][condition] = _value(sample)
+
+    disk_status: dict[str, dict[str, dict[str, float]]] = defaultdict(lambda: defaultdict(dict))
+    for sample in prom.get("longhorn_disk_status", []):
+        metric = _metric(sample)
+        node = str(metric.get("node") or "")
+        disk = str(metric.get("disk") or "")
+        condition = str(metric.get("condition") or "")
+        if node and disk and condition:
+            disk_status[node][disk][condition] = _value(sample)
+
+    disk_usage: dict[str, dict[str, dict[str, float]]] = defaultdict(lambda: defaultdict(dict))
+    for prom_key, field in [("longhorn_disk_capacity", "capacity"), ("longhorn_disk_usage", "usage"), ("longhorn_disk_reservation", "reservation")]:
+        for sample in prom.get(prom_key, []):
+            metric = _metric(sample)
+            node = str(metric.get("node") or "")
+            disk = str(metric.get("disk") or "")
+            if node and disk:
+                disk_usage[node][disk][field] = _value(sample)
+    return node_status, disk_status, disk_usage
+
+
+
+def _df_v2_lines_from_node_metrics(metrics: Mapping[str, Any]) -> list[str]:
+    """Convert node-exporter filesystem metrics into Checkmk's standard df_v2 format.
+
+    Values from Prometheus are bytes; df_v2 expects 1K-block values:
+      <device> <fstype> <size_kb> <used_kb> <avail_kb> <use%> <mountpoint>
+
+    Keep this deliberately conservative. The goal is to let Checkmk's built-in
+    filesystem check handle Harvester node filesystems, while avoiding noisy
+    bind mounts from the immutable/node appliance layout.
+    """
+    preferred_mounts = {
+        "/",
+        "/oem",
+        "/usr/local",
+        "/run/initramfs/cos-state",
+        "/var/lib/harvester/defaultdisk",
+    }
+    lines: list[str] = []
+    seen: set[str] = set()
+    for fs in sorted(metrics.get("filesystems", []) or [], key=lambda item: str(item.get("mountpoint") or "")):
+        if not isinstance(fs, Mapping):
+            continue
+        mount = str(fs.get("mountpoint") or "")
+        if mount not in preferred_mounts:
+            continue
+        try:
+            size_b = float(fs.get("size") or 0.0)
+            avail_b = float(fs.get("avail") or 0.0)
+        except Exception:
+            continue
+        if size_b <= 0:
+            continue
+        used_b = max(size_b - avail_b, 0.0)
+        size_kb = int(round(size_b / 1024.0))
+        used_kb = int(round(used_b / 1024.0))
+        avail_kb = int(round(avail_b / 1024.0))
+        used_pct = int(round((used_b / size_b) * 100.0)) if size_b else 0
+        device = str(fs.get("device") or "unknown").replace(" ", "\\040")
+        fstype = str(fs.get("fstype") or "unknown").replace(" ", "_")
+        escaped_mount = mount.replace(" ", "\\040")
+        if escaped_mount in seen:
+            continue
+        seen.add(escaped_mount)
+        lines.append(f"{device} {fstype} {size_kb} {used_kb} {avail_kb} {used_pct}% {escaped_mount}")
+    return lines
+
+
+def _state_policy(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "backup_target_not_configured_state": args.backup_target_not_configured_state,
+        "longhorn_degraded_volume_state": args.longhorn_degraded_volume_state,
+        "longhorn_degraded_volume_single_node_state": args.longhorn_degraded_volume_single_node_state,
+    }
+
+
+def _node_threshold_policy(args: argparse.Namespace) -> dict[str, float]:
+    return {
+        "cpu_usage_warn": args.node_cpu_usage_warn / 100.0,
+        "cpu_usage_crit": args.node_cpu_usage_crit / 100.0,
+        "memory_usage_warn": args.node_memory_usage_warn / 100.0,
+        "memory_usage_crit": args.node_memory_usage_crit / 100.0,
+    }
+
+
+def _longhorn_disk_threshold_policy(args: argparse.Namespace) -> dict[str, float]:
+    return {
+        "usage_warn": args.longhorn_disk_usage_warn / 100.0,
+        "usage_crit": args.longhorn_disk_usage_crit / 100.0,
+    }
+
+
+def emit_cluster_sections(args: argparse.Namespace, api: Mapping[str, Any], prom: Mapping[str, Sequence[Mapping[str, Any]]], prom_status: Mapping[str, Any]) -> None:
+    node_count = len(api.get("nodes", []) or [])
+    _write_section("harvester_settings_v1", {**_build_settings_section(api.get("harvester_settings", [])), "node_count": node_count})
+    _write_section("harvester_prometheus_status_v1", dict(prom_status))
+    _write_section("harvester_vm_images_v1", _build_vm_images_section(api.get("harvester_vm_images", [])))
+    _write_section("harvester_platform_pods_v1", _build_platform_pods_section(api.get("pods", [])))
+    _write_section("harvester_backup_targets_v1", {**_build_backup_targets_section(api.get("longhorn_backuptargets", [])), "policy": _state_policy(args)})
+    volumes = _build_longhorn_volumes_section(api.get("longhorn_volumes", []), prom, node_count)
+    volume_policy = _state_policy(args)
+    _write_section("longhorn_volume_summary_v1", {"summary": volumes.get("summary", {}), "count": len(volumes.get("volumes", [])), "node_count": node_count, "policy": volume_policy})
+    _write_section("longhorn_volumes_v1", {**volumes, "policy": volume_policy})
+    _write_section("longhorn_replicas_v1", _build_longhorn_replicas_section(api.get("longhorn_replicas", [])))
+
+
+def emit_node_sections(args: argparse.Namespace, api: Mapping[str, Any], prom: Mapping[str, Sequence[Mapping[str, Any]]]) -> None:
+    prom_node_info, ip_to_node = _node_info_from_prom(prom)
+    node_conditions = _node_conditions_from_prom(prom)
+    node_metrics = _node_metrics_from_prom(prom, ip_to_node)
+    nodeconfigs = _nodeconfigs_by_node(api.get("harvester_nodeconfigs", []))
+    blockdevices = _blockdevices_by_node(api.get("harvester_blockdevices", []))
+    lh_nodes = _longhorn_nodes_by_name(api.get("longhorn_nodes", []))
+    lh_node_prom, lh_disk_status_prom, lh_disk_usage_prom = _longhorn_status_from_prom(prom)
+
+    collector_by_node = api.get("node_collector_logs", {}) or {}
+    node_names = set(prom_node_info) | set(nodeconfigs) | set(blockdevices) | set(lh_nodes) | set(collector_by_node)
+    for node_obj in api.get("nodes", []):
+        name = _metadata_name(node_obj)
+        if name:
+            node_names.add(name)
+            prom_node_info.setdefault(name, {"node": name})
+            status = node_obj.get("status") or {}
+            metadata = node_obj.get("metadata") or {}
+            labels = metadata.get("labels") or {}
+            addresses = status.get("addresses") or []
+            prom_node_info[name].setdefault("kubernetes_conditions", status.get("conditions") or [])
+            prom_node_info[name].setdefault("addresses", addresses)
+            if isinstance(labels, Mapping):
+                prom_node_info[name].setdefault("kubernetes_labels", dict(labels))
+                prom_node_info[name].setdefault("roles", _node_roles_from_labels(labels))
+                prom_node_info[name].setdefault("architecture", labels.get("kubernetes.io/arch"))
+                prom_node_info[name].setdefault("hostname", labels.get("kubernetes.io/hostname"))
+                prom_node_info[name].setdefault("os", labels.get("kubernetes.io/os"))
+
+    for node in sorted(node_names):
+        if not _monitor_node(node, args.node_include_patterns, args.node_exclude_patterns):
+            continue
+        lh_node = lh_nodes.get(node, {"name": node, "conditions": [], "disks": []})
+        node_info = dict(prom_node_info.get(node, {"node": node}))
+        node_info["longhorn_node"] = bool(node in lh_nodes)
+        node_info["longhorn_disk_count"] = len(lh_node.get("disks", []) or [])
+        sections = {
+            "harvester_node_info_v1": node_info,
+            "harvester_node_conditions_v1": {"node": node, "conditions": node_conditions.get(node, {})},
+            "harvester_node_metrics_v1": {"node": node, **node_metrics.get(node, {}), "thresholds": _node_threshold_policy(args)},
+            "harvester_nodeconfig_v1": nodeconfigs.get(node, {"name": node}),
+            "harvester_blockdevices_v1": {"node": node, "devices": blockdevices.get(node, [])},
+            "longhorn_node_status_v1": {"node": node, **lh_node, "prometheus_status": lh_node_prom.get(node, {})},
+            "longhorn_disk_status_v1": {"node": node, "disks": lh_node.get("disks", []), "prometheus_status": lh_disk_status_prom.get(node, {})},
+            "longhorn_disk_usage_v1": {"node": node, "disks": lh_node.get("disks", []), "prometheus_usage": lh_disk_usage_prom.get(node, {}), "thresholds": _longhorn_disk_threshold_policy(args)},
+        }
+        collector = collector_by_node.get(node)
+        if isinstance(collector, Mapping):
+            node_info["node_collector"] = "yes" if collector.get("collector_available") else "error"
+            sections["harvester_node_local_os_v1"] = {
+                "node": node,
+                "collector_available": collector.get("collector_available"),
+                "collector_pod": collector.get("collector_pod"),
+                "collector_namespace": collector.get("collector_namespace"),
+                "collector_error": collector.get("collector_error"),
+                "collector_age_seconds": collector.get("collector_age_seconds"),
+                "collector_max_age_seconds": collector.get("collector_max_age_seconds"),
+                "timestamp": collector.get("timestamp"),
+                "os_release": collector.get("os_release") or {},
+                "kernel": collector.get("kernel") or {},
+                "uptime_seconds": collector.get("uptime_seconds"),
+                "loadavg": collector.get("loadavg") or {},
+                "native_sections": {
+                    name: bool(lines) for name, lines in (collector.get("standard_sections") or {}).items()
+                },
+            }
+            sections["harvester_node_local_processes_v1"] = {
+                "node": node,
+                "collector_available": collector.get("collector_available"),
+                "collector_error": collector.get("collector_error"),
+                "required_processes": collector.get("required_processes") or {},
+                "processes": collector.get("processes") or {},
+            }
+            sections["harvester_node_local_mounts_v1"] = {
+                "node": node,
+                "collector_available": collector.get("collector_available"),
+                "collector_error": collector.get("collector_error"),
+                "mounts": collector.get("mounts") or [],
+                "kernel_modules": collector.get("kernel_modules") or {},
+            }
+        raw_sections: dict[str, Sequence[str]] = {"df_v2": _df_v2_lines_from_node_metrics(node_metrics.get(node, {}))}
+        if isinstance(collector, Mapping):
+            standard_sections = collector.get("standard_sections") or {}
+            if isinstance(standard_sections, Mapping):
+                allowed = {"cpu", "mem", "uptime", "diskstat", "lnx_if:sep(58)", "ps_lnx"}
+                for section_name, lines in standard_sections.items():
+                    if section_name not in allowed or not isinstance(lines, list):
+                        continue
+                    raw_sections[str(section_name)] = [str(line) for line in lines]
+        _write_pb(_node_piggyback_name(args, node), sections, raw_sections=raw_sections)
+
+
+def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    args = parse_args(argv)
+    setup_logging(args.verbose)
+    if not args.verify_cert_api or not args.usage_verify_cert:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    try:
+        token = _resolve_token(args)
+        api = collect_api(args, token)
+        prom, prom_status = collect_prometheus(args, token)
+        emit_cluster_sections(args, api, prom, prom_status)
+        emit_node_sections(args, api, prom)
+    except Exception as exc:
+        if args.debug:
+            raise
+        sys.stderr.write(str(exc) + "\n")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
