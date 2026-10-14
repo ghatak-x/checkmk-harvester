@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.2
+
+- Use namespace-qualified `namespace/pvc` Longhorn volume service items, falling back to Longhorn volume IDs for volumes without complete PVC metadata. Rediscover Longhorn volume services after upgrading.
+- Replace the reserved `cmk/harvester/` host-label prefix with `harvester/` and remove volatile labels such as counts, IPs, versions and operational states. Update host-label matching rules after upgrading.
+- Reject collector payloads with a node ID missing or different from the Kubernetes pod's `spec.nodeName`.
+- Reject collector-supplied section and piggyback markers in raw agent output, including markers hidden after embedded newlines.
+- Add regression tests for namespace collisions, host-label stability and collector output integrity.
+
 ## 0.1.1
 
 - Make Kubernetes API authentication, permission, network, timeout, and server failures visible as special-agent errors instead of silently treating them as empty lists.

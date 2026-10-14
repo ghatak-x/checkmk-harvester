@@ -37,8 +37,8 @@ Build the MKP locally or download it from a GitHub release / Checkmk Exchange pa
 
 ```bash
 python tools/build_mkp.py
-mkp add dist/harvester-0.1.1.mkp
-mkp enable harvester 0.1.1
+mkp add dist/harvester-0.1.2.mkp
+mkp enable harvester 0.1.2
 cmk -R
 ```
 
@@ -100,3 +100,11 @@ python tools/build_mkp.py
 ## License
 
 GPL-2.0-only. See `LICENSE`.
+
+## Upgrading to v0.1.2
+
+Longhorn PVC-bound volume service items now use `namespace/pvc`, eliminating collisions between PVCs with the same name in different namespaces. Use Checkmk service discovery to accept the new services and remove the old bare-PVC services. Existing history is not automatically transferred.
+
+Harvester-discovered host labels now use `harvester/` rather than Checkmk-reserved `cmk/harvester/`. Dynamic values (counts, IPs, version strings, operational flags) are no longer host labels. Update any rules matching old labels and run host-label discovery. Cluster/node status and other operational details remain available via their checks.
+
+Optional collector log data is validated against the pod's Kubernetes node assignment and sanitized to prevent additional Checkmk sections or arbitrary piggyback hosts from being introduced via log contents.

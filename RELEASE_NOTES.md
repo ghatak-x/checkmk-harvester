@@ -1,13 +1,11 @@
-# Harvester v0.1.1
+# Harvester v0.1.2
 
-Patch release addressing API failure visibility and credential isolation.
+Corrective release addressing three additional code-review findings:
 
-- The Harvester special agent now fails visibly when the Kubernetes API returns 401/403 or other unexpected errors, or when it cannot reach the API server.
-- HTTP 404 is treated as an empty list only for explicitly optional Harvester/Longhorn CRDs. Kubernetes nodes, pods and Harvester settings remain mandatory.
-- Invalid API list payloads now fail instead of silently removing services.
-- The Kubernetes token is no longer sent to Prometheus. Prometheus bearer authentication can be configured separately, if needed.
-- Automatic redirects for API requests are disabled to avoid forwarding credentials.
+- **Longhorn service identities:** PVC-backed volumes now use `namespace/pvc` instead of bare PVC names; volumes without complete PVC metadata fall back to their Longhorn volume ID. Checks and discovery use the same identity.
+- **Host labels:** Checkmk-reserved `cmk/harvester/...` labels are replaced by plugin-owned `harvester/...` labels. Dynamic values such as node/disk counts, IPs, version strings and collector availability are omitted as host labels; they remain visible in relevant service output where available.
+- **Node collector output validation:** Section/piggyback delimiter lines from collector logs are filtered, including embedded-line delimiters. Collector-reported node identity must exactly match the Kubernetes pod's `spec.nodeName`; mismatches are marked unavailable for that pod's node.
 
-**Compatibility:** Existing source-host checks and node piggyback names remain unchanged. For Prometheus endpoints that previously required the Kubernetes token, configure independent Prometheus authentication in the Harvester rule. On installations using unauthenticated Prometheus, no new configuration is necessary.
+**Upgrade notice:** After upgrading, run service and host-label discovery on the Harvester cluster and its piggyback nodes. Longhorn PVC service names change (for example, `Longhorn volume mypvc` becomes `Longhorn volume default/mypvc`), creating new Checkmk services; old service graphs do not migrate automatically. Update rules referencing `cmk/harvester/*` host labels to `harvester/*` or remove references to labels that were deliberately dropped. Other service names and piggyback host naming remain unchanged.
 
-Test on Checkmk 2.5 before upgrading production. No changes are required to the node collector DaemonSet or Kubernetes RBAC manifest.
+Includes all 0.1.1 corrections for Kubernetes API error handling and Prometheus credential isolation. Test the MKP on Checkmk 2.5 before uploading the release to GitHub/Exchange.
