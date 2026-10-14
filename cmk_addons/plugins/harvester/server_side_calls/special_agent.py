@@ -44,6 +44,8 @@ def _agent_arguments(params: dict[str, Any], host_config: HostConfig) -> Iterabl
         if timeout.get("read") is not None:
             args.extend(["--k8s-api-read-timeout", str(timeout["read"])])
 
+    if prom.get("token") is not None:
+        args.extend(["--prometheus-token-id", prom["token"]])
     if prom.get("verify_cert"):
         args.append("--usage-verify-cert")
     if proxy := prom.get("proxy"):

@@ -20,6 +20,7 @@ import time
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 import urllib3
@@ -79,6 +80,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--k8s-api-connect-timeout", type=int, default=10)
     p.add_argument("--k8s-api-read-timeout", type=int, default=20)
     p.add_argument("--prometheus-endpoint", required=True)
+    parser_add_secret_option(p, long="--prometheus-token", help="Optional independent Prometheus bearer token", required=False)
     p.add_argument("--usage-proxy", default="FROM_ENVIRONMENT")
     p.add_argument("--usage-verify-cert", action="store_true")
     p.add_argument("--usage-connect-timeout", type=int, default=10)
@@ -122,6 +124,23 @@ def _resolve_token(args: argparse.Namespace) -> str:
     return resolve_secret_option(args, "token").reveal()
 
 
+def _resolve_prometheus_token(args: argparse.Namespace) -> str | None:
+    if not (getattr(args, "prometheus_token", None) or getattr(args, "prometheus_token_id", None)):
+        return None
+    return resolve_secret_option(args, "prometheus_token").reveal()
+
+
+def _validate_prometheus_token_transport(endpoint: str, verify_certificate: bool) -> None:
+    """Never send Prometheus credentials over untrusted HTTP or unverified TLS."""
+    parsed = urlsplit(endpoint)
+    loopback = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    if parsed.scheme == "https" and (verify_certificate or loopback):
+        return
+    if parsed.scheme == "http" and loopback:
+        return
+    raise ValueError("Prometheus bearer authentication requires verified HTTPS (or a loopback endpoint)")
+
+
 def _proxy(value: str) -> Mapping[str, str] | None:
     if value == "FROM_ENVIRONMENT":
         return None
@@ -131,7 +150,11 @@ def _proxy(value: str) -> Mapping[str, str] | None:
 
 
 def _get_json(session: requests.Session, url: str, **kwargs: Any) -> Mapping[str, Any]:
-    response = session.get(url, **kwargs)
+    # Never forward credentials to a redirected URL, even on the same host.
+    response = session.get(url, allow_redirects=False, **kwargs)
+    # Requests' raise_for_status() does not reject redirects by itself.
+    if 300 <= response.status_code < 400:
+        raise requests.HTTPError(f"Refusing HTTP redirect ({response.status_code}) from {url}", response=response)
     response.raise_for_status()
     data = response.json()
     if not isinstance(data, Mapping):
@@ -139,17 +162,31 @@ def _get_json(session: requests.Session, url: str, **kwargs: Any) -> Mapping[str
     return data
 
 
-def _list_items(session: requests.Session, endpoint: str, path: str, **kwargs: Any) -> list[Mapping[str, Any]]:
+def _list_items(
+    session: requests.Session,
+    endpoint: str,
+    path: str,
+    *,
+    optional: bool = False,
+    **kwargs: Any,
+) -> list[Mapping[str, Any]]:
+    """List API resources; tolerate HTTP 404 only for explicitly optional CRDs.
+
+    Authorization, transport, and server errors are fatal. Otherwise a failed
+    API request could look like an empty Harvester cluster to Checkmk.
+    """
     try:
         data = _get_json(session, endpoint.rstrip("/") + path, **kwargs)
     except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "unknown"
-        LOG.warning("Skipping %s, HTTP status %s", path, status)
-        return []
-    except requests.RequestException as exc:
-        LOG.warning("Skipping %s: %s", path, exc)
-        return []
-    return [item for item in data.get("items", []) if isinstance(item, Mapping)]
+        status = exc.response.status_code if exc.response is not None else None
+        if optional and status == 404:
+            LOG.warning("Optional Kubernetes resource unavailable (HTTP 404): %s", path)
+            return []
+        raise
+    items = data.get("items")
+    if not isinstance(items, list):
+        raise RuntimeError(f"Invalid Kubernetes list response for {path}: missing or invalid items list")
+    return [item for item in items if isinstance(item, Mapping)]
 
 
 
@@ -222,6 +259,7 @@ def _collect_node_collector_logs(session: requests.Session, endpoint: str, args:
         try:
             response = session.get(
                 url,
+                allow_redirects=False,
                 params={"container": args.node_collector_container, "tailLines": str(args.node_collector_tail_lines)},
                 verify=request_kwargs.get("verify"),
                 timeout=request_kwargs.get("timeout"),
@@ -409,20 +447,22 @@ def collect_api(args: argparse.Namespace, token: str) -> dict[str, Any]:
             "nodes": _list_items(session, args.api_server_endpoint, "/api/v1/nodes", **kwargs),
             "pods": _list_items(session, args.api_server_endpoint, "/api/v1/pods", **kwargs),
             "harvester_settings": _list_items(session, args.api_server_endpoint, "/apis/harvesterhci.io/v1beta1/settings", **kwargs),
-            "harvester_nodeconfigs": _list_items(session, args.api_server_endpoint, "/apis/node.harvesterhci.io/v1beta1/nodeconfigs", **kwargs),
-            "harvester_blockdevices": _list_items(session, args.api_server_endpoint, "/apis/harvesterhci.io/v1beta1/blockdevices", **kwargs),
-            "harvester_vm_images": _list_items(session, args.api_server_endpoint, "/apis/harvesterhci.io/v1beta1/virtualmachineimages", **kwargs),
-            "harvester_vm_backups": _list_items(session, args.api_server_endpoint, "/apis/harvesterhci.io/v1beta1/virtualmachinebackups", **kwargs),
-            "longhorn_nodes": _list_items(session, args.api_server_endpoint, "/apis/longhorn.io/v1beta2/namespaces/longhorn-system/nodes", **kwargs),
-            "longhorn_volumes": _list_items(session, args.api_server_endpoint, "/apis/longhorn.io/v1beta2/namespaces/longhorn-system/volumes", **kwargs),
-            "longhorn_replicas": _list_items(session, args.api_server_endpoint, "/apis/longhorn.io/v1beta2/namespaces/longhorn-system/replicas", **kwargs),
-            "longhorn_backuptargets": _list_items(session, args.api_server_endpoint, "/apis/longhorn.io/v1beta2/namespaces/longhorn-system/backuptargets", **kwargs),
+            "harvester_nodeconfigs": _list_items(session, args.api_server_endpoint, "/apis/node.harvesterhci.io/v1beta1/nodeconfigs", optional=True, **kwargs),
+            "harvester_blockdevices": _list_items(session, args.api_server_endpoint, "/apis/harvesterhci.io/v1beta1/blockdevices", optional=True, **kwargs),
+            "harvester_vm_images": _list_items(session, args.api_server_endpoint, "/apis/harvesterhci.io/v1beta1/virtualmachineimages", optional=True, **kwargs),
+            "harvester_vm_backups": _list_items(session, args.api_server_endpoint, "/apis/harvesterhci.io/v1beta1/virtualmachinebackups", optional=True, **kwargs),
+            "longhorn_nodes": _list_items(session, args.api_server_endpoint, "/apis/longhorn.io/v1beta2/namespaces/longhorn-system/nodes", optional=True, **kwargs),
+            "longhorn_volumes": _list_items(session, args.api_server_endpoint, "/apis/longhorn.io/v1beta2/namespaces/longhorn-system/volumes", optional=True, **kwargs),
+            "longhorn_replicas": _list_items(session, args.api_server_endpoint, "/apis/longhorn.io/v1beta2/namespaces/longhorn-system/replicas", optional=True, **kwargs),
+            "longhorn_backuptargets": _list_items(session, args.api_server_endpoint, "/apis/longhorn.io/v1beta2/namespaces/longhorn-system/backuptargets", optional=True, **kwargs),
         }
         data["node_collector_logs"] = _collect_node_collector_logs(session, args.api_server_endpoint, args, kwargs)
         return data
 
 
-def collect_prometheus(args: argparse.Namespace, token: str) -> tuple[dict[str, list[Mapping[str, Any]]], dict[str, Any]]:
+def collect_prometheus(args: argparse.Namespace, prometheus_token: str | None = None) -> tuple[dict[str, list[Mapping[str, Any]]], dict[str, Any]]:
+    if prometheus_token:
+        _validate_prometheus_token_transport(args.prometheus_endpoint, args.usage_verify_cert)
     if not args.usage_verify_cert:
         LOG.warning("Disabling SSL certificate verification for Prometheus endpoint.")
     kwargs = {
@@ -435,7 +475,9 @@ def collect_prometheus(args: argparse.Namespace, token: str) -> tuple[dict[str, 
     successful = 0
     empty = 0
     with requests.Session() as session:
-        session.headers.update({"Authorization": f"Bearer {token}"})
+        # Never reuse the Kubernetes API token for a separate Prometheus URL.
+        if prometheus_token:
+            session.headers.update({"Authorization": f"Bearer {prometheus_token}"})
         for name, query in PROM_QUERIES.items():
             samples, ok, error = _prom_query_with_status(session, args.prometheus_endpoint, query, **kwargs)
             result[name] = samples
@@ -972,7 +1014,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         token = _resolve_token(args)
         api = collect_api(args, token)
-        prom, prom_status = collect_prometheus(args, token)
+        prom, prom_status = collect_prometheus(args, _resolve_prometheus_token(args))
         emit_cluster_sections(args, api, prom, prom_status)
         emit_node_sections(args, api, prom)
     except Exception as exc:
