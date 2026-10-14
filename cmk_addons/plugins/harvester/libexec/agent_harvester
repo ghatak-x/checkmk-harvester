@@ -285,6 +285,18 @@ def _collect_node_collector_logs(session: requests.Session, endpoint: str, args:
                 "collector_age_seconds": None,
             }
             continue
+        # Collector logs are untrusted input.  Never accept a payload claiming
+        # another Kubernetes node (or no node); piggyback data is keyed solely
+        # by the verified pod spec.nodeName.
+        if payload.get("node") != node:
+            result[node] = {
+                "node": node,
+                "collector_available": False,
+                "collector_pod": pod_name,
+                "collector_error": "collector payload node does not match pod spec.nodeName",
+                "collector_age_seconds": None,
+            }
+            continue
         payload = dict(payload)
         timestamp = payload.get("timestamp")
         age = None
@@ -293,14 +305,14 @@ def _collect_node_collector_logs(session: requests.Session, endpoint: str, args:
         except Exception:
             pass
         payload.update({
-            "node": str(payload.get("node") or node),
+            "node": node,
             "collector_available": True,
             "collector_pod": pod_name,
             "collector_namespace": args.node_collector_namespace,
             "collector_age_seconds": age,
             "collector_max_age_seconds": args.node_collector_max_age,
         })
-        result[str(payload.get("node") or node)] = payload
+        result[node] = payload
     return result
 
 def _write_section(section_name: str, data: Mapping[str, Any]) -> None:
@@ -309,12 +321,27 @@ def _write_section(section_name: str, data: Mapping[str, Any]) -> None:
     sys.stdout.write(json.dumps(data, separators=(",", ":"), sort_keys=True) + "\n")
 
 
+def _safe_raw_lines(lines: Sequence[str]) -> list[str]:
+    """Do not let collector-supplied text create Checkmk sections/piggybacks.
+
+    Split embedded CR/LF as well: rejecting just the start of each input item
+    would miss a marker injected after a newline within that item.
+    """
+    safe = []
+    for line in lines:
+        for part in str(line).splitlines():
+            if not part.lstrip().startswith("<<<"):
+                safe.append(part)
+    return safe
+
+
 def _write_raw_section(section_name: str, lines: Sequence[str]) -> None:
-    if not lines:
+    sanitized = _safe_raw_lines(lines)
+    if not sanitized:
         return
     sys.stdout.write(f"<<<{section_name}>>>\n")
-    for line in lines:
-        sys.stdout.write(line.rstrip("\n") + "\n")
+    for line in sanitized:
+        sys.stdout.write(line + "\n")
 
 
 def _write_pb(piggyback: str, sections: Mapping[str, Mapping[str, Any]], raw_sections: Mapping[str, Sequence[str]] | None = None) -> None:
@@ -1000,7 +1027,7 @@ def emit_node_sections(args: argparse.Namespace, api: Mapping[str, Any], prom: M
                 for section_name, lines in standard_sections.items():
                     if section_name not in allowed or not isinstance(lines, list):
                         continue
-                    raw_sections[str(section_name)] = [str(line) for line in lines]
+                    raw_sections[str(section_name)] = _safe_raw_lines(lines)
         _write_pb(_node_piggyback_name(args, node), sections, raw_sections=raw_sections)
 
 

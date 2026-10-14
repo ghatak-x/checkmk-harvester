@@ -98,51 +98,28 @@ def _label_value(value: Any) -> str | None:
 
 
 def _host_labels_harvester_settings(section: Mapping[str, Any]) -> Iterable[HostLabel]:
-    yield HostLabel("cmk/harvester/object", "cluster")
-    if version := _label_value(section.get("server_version")):
-        yield HostLabel("cmk/harvester/server_version", version)
-        # Useful grouping label without patch-level or build metadata assumptions.
-        parts = version.lstrip("v").split(".")
-        if len(parts) >= 2:
-            yield HostLabel("cmk/harvester/version_family", f"v{parts[0]}.{parts[1]}")
-    if storage := _label_value(section.get("default_storage_class")):
-        yield HostLabel("cmk/harvester/default_storage_class", storage)
-    if section.get("node_count") is not None:
-        yield HostLabel("cmk/harvester/node_count", str(section.get("node_count")))
-    backup_target = section.get("backup_target")
-    yield HostLabel("cmk/harvester/backup_target_configured", "yes" if backup_target not in (None, "", "{}") else "no")
-    for setting in section.get("important_settings", []) or []:
-        if setting.get("name") == "upgrade-checker-enabled" and (value := _label_value(setting.get("value"))) is not None:
-            yield HostLabel("cmk/harvester/upgrade_checker_enabled", value.lower())
+    """Expose stable classification labels, not operational metrics.
+
+    Node counts, settings, health, and release versions belong in services: they
+    change during normal operation and should not churn discovered host labels.
+    """
+    yield HostLabel("harvester/object", "cluster")
 
 
 def _host_labels_node_info(section: Mapping[str, Any]) -> Iterable[HostLabel]:
-    yield HostLabel("cmk/harvester/object", "node")
-    if os_image := _label_value(section.get("os_image")):
-        yield HostLabel("cmk/harvester/os_image", os_image)
-    if kubelet := _label_value(section.get("kubelet_version")):
-        yield HostLabel("cmk/harvester/kubelet_version", kubelet)
+    yield HostLabel("harvester/object", "node")
     if runtime := _label_value(section.get("container_runtime_version")):
-        yield HostLabel("cmk/harvester/container_runtime", runtime.split("://", 1)[0])
-    if kernel := _label_value(section.get("kernel_version") or section.get("release")):
-        yield HostLabel("cmk/harvester/kernel_version", kernel)
-    if ip := _label_value(section.get("internal_ip")):
-        yield HostLabel("cmk/harvester/internal_ip", ip)
+        yield HostLabel("harvester/container_runtime", runtime.split("://", 1)[0])
     if machine := _label_value(section.get("machine") or section.get("architecture")):
-        yield HostLabel("cmk/harvester/architecture", machine)
+        yield HostLabel("harvester/architecture", machine)
     if provider_id := _label_value(section.get("provider_id")):
-        yield HostLabel("cmk/harvester/provider", provider_id.split("://", 1)[0])
-    if roles := section.get("roles"):
-        if isinstance(roles, list) and roles:
-            yield HostLabel("cmk/harvester/node_roles", ",".join(str(role) for role in roles))
-            for role in roles:
-                yield HostLabel(f"cmk/harvester/node_role/{role}", "yes")
-    yield HostLabel("cmk/harvester/node_exporter", "yes" if section.get("node_exporter_instance") else "no")
-    if section.get("node_collector"):
-        yield HostLabel("cmk/harvester/node_collector", str(section.get("node_collector")))
-    yield HostLabel("cmk/harvester/longhorn_node", "yes" if section.get("longhorn_node") else "no")
-    if section.get("longhorn_disk_count") is not None:
-        yield HostLabel("cmk/harvester/longhorn_disk_count", str(section.get("longhorn_disk_count")))
+        yield HostLabel("harvester/provider", provider_id.split("://", 1)[0])
+    # Node roles are intentionally discoverable classification data for rules.
+    roles = section.get("roles")
+    if isinstance(roles, list) and roles:
+        for role in roles:
+            if role and _label_value(role):
+                yield HostLabel(f"harvester/node_role/{role}", "yes")
 
 
 # Cluster/source host checks
@@ -303,16 +280,29 @@ def _check_longhorn_volume_summary(section: Mapping[str, Any]) -> Iterable[Resul
     yield Metric("longhorn_volumes_faulted", faulted)
 
 
+def _longhorn_volume_item(volume: Mapping[str, Any]) -> str | None:
+    """Identify PVC-bound Longhorn volumes by namespace/PVC; otherwise use volume ID.
+
+    A bare PVC name is not globally unique.  When Kubernetes PVC metadata is
+    absent (e.g. an unattached/orphaned volume), the Longhorn volume name is
+    already cluster-unique and makes a suitable fallback.
+    """
+    pvc = _label_value(volume.get("pvc"))
+    namespace = _label_value(volume.get("pvc_namespace"))
+    if pvc and namespace:
+        return f"{namespace}/{pvc}"
+    return _label_value(volume.get("name"))
+
+
 def _discover_longhorn_volumes(section: Mapping[str, Any]) -> Iterable[Service]:
     for volume in section.get("volumes", []) or []:
-        item = volume.get("pvc") or volume.get("name")
-        if item:
-            yield Service(item=str(item))
+        if item := _longhorn_volume_item(volume):
+            yield Service(item=item)
 
 
 def _check_longhorn_volume(item: str, section: Mapping[str, Any]) -> Iterable[Result]:
     for volume in section.get("volumes", []) or []:
-        if item not in {volume.get("pvc"), volume.get("name")}:
+        if item != _longhorn_volume_item(volume):
             continue
         robustness = str(volume.get("robustness") or "unknown")
         state = str(volume.get("state") or "unknown")
@@ -558,33 +548,22 @@ def _check_longhorn_disk_usage(item: str, section: Mapping[str, Any]) -> Iterabl
 # Optional local Harvester node collector checks
 
 def _host_labels_local_os(section: Mapping[str, Any]) -> Iterable[HostLabel]:
-    if section.get("collector_available"):
-        yield HostLabel("cmk/harvester/node_collector", "yes")
-    elif section.get("collector_error"):
-        yield HostLabel("cmk/harvester/node_collector", "error")
-    os_release = section.get("os_release", {}) or {}
-    if pretty := _label_value(os_release.get("PRETTY_NAME")):
-        yield HostLabel("cmk/harvester/local_pretty_name", pretty)
+    """Stable OS-family labels only; keep version/build details in node checks."""
+    os_release = section.get("os_release") or {}
+    if not isinstance(os_release, Mapping):
+        return
     if suse_pretty := _label_value(os_release.get("SUSE_PRETTY_NAME")):
-        yield HostLabel("cmk/harvester/suse_pretty_name", suse_pretty)
         if "micro" in suse_pretty.lower():
-            yield HostLabel("cmk/harvester/base_os", "suse-linux-micro")
+            yield HostLabel("harvester/base_os", "suse-linux-micro")
     if name := _label_value(os_release.get("NAME")):
-        yield HostLabel("cmk/harvester/os_name", name)
+        yield HostLabel("harvester/os_name", name)
     if os_id := _label_value(os_release.get("ID")):
-        yield HostLabel("cmk/harvester/os_id", os_id)
-    if version_id := _label_value(os_release.get("VERSION_ID")):
-        yield HostLabel("cmk/harvester/os_version_id", version_id)
-    if variant := _label_value(os_release.get("VARIANT_ID") or os_release.get("VARIANT")):
-        yield HostLabel("cmk/harvester/local_variant", variant)
+        yield HostLabel("harvester/os_id", os_id)
     if variant_name := _label_value(os_release.get("VARIANT")):
-        yield HostLabel("cmk/harvester/variant", variant_name)
-    variant_id = _label_value(os_release.get("VARIANT_ID"))
-    if variant_id:
-        yield HostLabel("cmk/harvester/variant_id", variant_id)
-    # Harvester/SUSE Linux Micro uses a transactional, appliance-style layout.
-    if (variant_id and "harvester" in variant_id.lower()) or "micro" in str(os_release.get("SUSE_PRETTY_NAME", "")).lower():
-        yield HostLabel("cmk/harvester/transactional", "yes")
+        yield HostLabel("harvester/variant", variant_name)
+    variant_id = str(os_release.get("VARIANT_ID") or "")
+    if "harvester" in variant_id.lower() or "micro" in str(os_release.get("SUSE_PRETTY_NAME") or "").lower():
+        yield HostLabel("harvester/transactional", "yes")
 
 
 def _check_node_local_os(section: Mapping[str, Any]) -> Iterable[Result]:
